@@ -53,7 +53,7 @@ def build_zero_shot_classifier(
         num_batch_classes = len(batch_classnames)
         texts = [template.format(c) if use_format else template(c) for c in batch_classnames for template in templates]
         texts = tokenizer(texts).to(device)
-        class_embeddings = F.normalize(model.encode_text(texts), dim=-1)
+        class_embeddings = model.encode_text(texts, normalize=True)
         class_embeddings = class_embeddings.reshape(num_batch_classes, num_templates, -1).mean(dim=1)
         class_embeddings = class_embeddings / class_embeddings.norm(dim=1, keepdim=True)
         class_embeddings = class_embeddings.T
@@ -100,8 +100,8 @@ def build_zero_shot_classifier_legacy(
         for classname in iter_wrap(classnames):
             texts = [template.format(classname) if use_format else template(classname) for template in templates]
             texts = tokenizer(texts).to(device)  # tokenize
-            class_embeddings = model.encode_text(texts)
-            class_embedding = F.normalize(class_embeddings, dim=-1).mean(dim=0)
+            class_embeddings = model.encode_text(texts, normalize=True)
+            class_embedding = class_embeddings.mean(dim=0)
             class_embedding /= class_embedding.norm()
             zeroshot_weights.append(class_embedding)
         zeroshot_weights = torch.stack(zeroshot_weights, dim=1).to(device)

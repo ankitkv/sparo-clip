@@ -230,6 +230,7 @@ def main(args):
         image_std=args.image_std,
         aug_cfg=args.aug_cfg,
         output_dict=True,
+        override_config=args.override_model_config,
     )
     if args.distill:
         # FIXME: currenlty assumes the model your distilling from has the same tokenizer & transforms.
@@ -292,6 +293,12 @@ def main(args):
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    logging.info(f"Total params: {total_params}")
+    if args.max_params > 0 and total_params > args.max_params:
+        logging.error(f"Model size exceeds max params: {total_params} > {args.max_params}")
+        exit(1)
 
     # create optimizer and scaler
     optimizer = None
@@ -384,11 +391,12 @@ def main(args):
         # you will have to configure this for your project!
         wandb.init(
             project=args.wandb_project_name,
+            entity=args.wandb_entity,
             name=args.name,
             id=args.name,
             notes=args.wandb_notes,
             tags=[],
-            resume='auto' if args.resume == "latest" else None,
+            resume='allow' if resume_latest else None,
             config=vars(args),
         )
         if args.debug:
@@ -406,7 +414,7 @@ def main(args):
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
         # Evaluate.
-        evaluate(model, data, start_epoch, args, writer)
+        evaluate(model, data, start_epoch, 0, args, writer)
         return
 
     loss = create_loss(args)
@@ -415,11 +423,11 @@ def main(args):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        step = train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, writer)
+            evaluate(model, data, completed_epoch, step, args, writer)
 
         # Saving checkpoints.
         if args.save_logs:

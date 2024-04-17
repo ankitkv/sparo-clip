@@ -160,6 +160,61 @@ class Attention(nn.Module):
         return x
 
 
+class SPARO(nn.Module):
+    def __init__(self, dim, L, V, attn_dim, value_dim=None, num_heads=None, share_kv=True):
+        super().__init__()
+        if value_dim is None:
+            value_dim = attn_dim
+
+        self.L = L
+        self.attn_dim = attn_dim
+        self.value_dim = value_dim
+        self.num_heads = num_heads if num_heads is not None else L
+        self.num_subheads = L // self.num_heads
+        self.share_kv = share_kv
+
+        self.scale = self.attn_dim**-0.5
+
+        self.q_emb = nn.Parameter(torch.randn(1, self.num_heads, self.num_subheads, 1, self.attn_dim))
+        self.k = nn.Linear(dim, self.num_heads * self.attn_dim)
+        nn.init.xavier_uniform_(self.k.weight)
+        nn.init.zeros_(self.k.bias)
+        if not share_kv:
+            self.v = nn.Linear(dim, self.num_heads * self.value_dim)
+            nn.init.xavier_uniform_(self.v.weight)
+            nn.init.zeros_(self.v.bias)
+        else:
+            assert self.value_dim == self.attn_dim
+            self.v = self.k
+
+        self.proj = nn.Linear(self.value_dim, V)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, eos_indices=None):
+        B, N = x.shape[:2]
+        q = self.q_emb  # 1, nh, L/nh, 1, H
+        # B, nh, L/nh, N, H
+        k = self.k(x).view(B, N, self.num_heads, 1, self.attn_dim).expand(
+            -1, -1, -1, self.num_subheads, -1).permute(0, 2, 3, 1, 4)
+        v = self.v(x).view(B, N, self.num_heads, 1, self.value_dim).expand(
+            -1, -1, -1, self.num_subheads, -1).permute(0, 2, 3, 1, 4)
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)  # B, nh, L/nh, 1, N
+
+        attn_mask = None
+        if eos_indices is not None:  # text
+            attn_mask = torch.arange(N, device=x.device)[None, None, None, None, :] > eos_indices[:, None, None, None, None]
+        if attn_mask is not None:
+            # set the true values of attn_mask to -inf
+            attn_mask = torch.where(attn_mask, float("-inf"), torch.zeros_like(attn_mask, dtype=attn.dtype))
+            attn += attn_mask
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).view(B, self.L, -1)  # B, L, H
+        x = self.proj(x)  # B, L, V
+        return x, attn.view(B, self.L, -1)
+
+
 class AttentionalPooler(nn.Module):
     def __init__(
             self,
@@ -175,11 +230,15 @@ class AttentionalPooler(nn.Module):
         self.ln_q = norm_layer(d_model)
         self.ln_k = norm_layer(context_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, eos_indices: Optional[torch.Tensor] = None):
         x = self.ln_k(x).permute(1, 0, 2)  # NLD -> LND
-        N = x.shape[1]
+        L, N = x.shape[:2]
         q = self.ln_q(self.query)
-        out = self.attn(self._repeat(q, N), x, x, need_weights=False)[0]
+        if eos_indices is not None:
+            key_padding_mask = torch.arange(L, device=x.device)[None, :] > eos_indices[:, None]
+        else:
+            key_padding_mask = None
+        out = self.attn(self._repeat(q, N), x, x, need_weights=False, key_padding_mask=key_padding_mask)[0]
         return out.permute(1, 0, 2)  # LND -> NLD
 
     def _repeat(self, query, N: int):
@@ -343,14 +402,18 @@ class VisionTransformer(nn.Module):
             input_patchnorm: bool = False,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
-            output_tokens: bool = False
+            output_tokens: bool = False,
+            projection_in_dim: Optional[int] = None,
+            use_codebook=False,
     ):
         super().__init__()
         self.output_tokens = output_tokens
         image_height, image_width = self.image_size = to_2tuple(image_size)
         patch_height, patch_width = self.patch_size = to_2tuple(patch_size)
+        self.width = width
         self.grid_size = (image_height // patch_height, image_width // patch_width)
         self.output_dim = output_dim
+        self.use_codebook = use_codebook
 
         # whether to layernorm each patch, as done in dual patchnorm paper - https://arxiv.org/abs/2302.01327v1
         self.input_patchnorm = input_patchnorm
@@ -383,16 +446,26 @@ class VisionTransformer(nn.Module):
         )
 
         self.global_average_pool = global_average_pool
-        if attentional_pool:
-            self.attn_pool = AttentionalPooler(output_dim, width, n_head=attn_pooler_heads, n_queries=n_queries)
-            self.ln_post = norm_layer(output_dim)
-            self.proj = nn.Parameter(scale * torch.randn(output_dim, output_dim))
-        else:
-            self.attn_pool = None
-            self.ln_post = norm_layer(width)
-            self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
+        if not use_codebook:
+            if attentional_pool:
+                self.attn_pool = AttentionalPooler(output_dim, width, n_head=attn_pooler_heads, n_queries=n_queries)
+                self.ln_post = norm_layer(output_dim)
+                self.proj = nn.Parameter(scale * torch.randn(output_dim, output_dim))
+            else:
+                self.attn_pool = None
+                self.ln_post = norm_layer(width)
+                if not projection_in_dim:
+                    projection_in_dim = width
+                else:
+                    scale = projection_in_dim ** -0.5
+                self.proj = nn.Parameter(scale * torch.randn(projection_in_dim, output_dim))
+
+        self.create_extra_modules()
         self.init_parameters()
+
+    def create_extra_modules(self):
+        pass
 
     def lock(self, unlocked_groups=0, freeze_bn_stats=False):
         for param in self.parameters():
@@ -486,6 +559,11 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        return self.forward_output(x)
+
+    def forward_output(self, x: torch.Tensor):
+        if self.use_codebook:
+            return x[:, 1:, :]
         if self.attn_pool is not None:
             x = self.attn_pool(x)
             x = self.ln_post(x)
@@ -501,6 +579,50 @@ class VisionTransformer(nn.Module):
             return pooled, tokens
         
         return pooled
+
+
+class SPAROVisionTransformer(VisionTransformer):
+    def __init__(
+        self,
+        L,
+        V,
+        width,
+        heads,
+        attn_dim=None,
+        value_dim=None,
+        sparo_heads=None,
+        share_kv=True,
+        **kwargs,
+    ):
+        self.L = L
+        self.V = V
+        self.attn_dim = attn_dim
+        self.value_dim = value_dim
+        self.sparo_heads = sparo_heads
+        self.width = width
+        self.heads = heads
+        self.share_kv = share_kv
+        super().__init__(width=width, heads=heads, **kwargs)
+
+    def create_extra_modules(self):
+        if self.attn_dim is None:
+            self.attn_dim = self.width // self.heads
+        self.sparo = SPARO(
+            dim=self.width,
+            L=self.L,
+            V=self.V,
+            attn_dim=self.attn_dim,
+            value_dim=self.value_dim,
+            num_heads=self.sparo_heads,
+            share_kv=self.share_kv,
+        )
+        del self.proj
+
+    def forward_output(self, x: torch.Tensor):
+        x = self.ln_post(x)  # B, L, H
+        out, attn = self.sparo(x)  # B, L, V
+        out = out.view(-1, self.L * self.V)
+        return out, attn
 
 
 class TextTransformer(nn.Module):
@@ -520,6 +642,12 @@ class TextTransformer(nn.Module):
             embed_cls: bool = False,
             pad_id: int = 0,
             output_tokens: bool = False,
+            global_average_pool: bool = False,
+            attentional_pool: bool = False,
+            n_queries: int = 256,
+            attn_pooler_heads: int = 8,
+            projection_in_dim: Optional[int] = None,
+            use_codebook=False,
     ):
         super().__init__()
         self.output_tokens = output_tokens
@@ -529,8 +657,11 @@ class TextTransformer(nn.Module):
         self.output_dim = output_dim
         self.heads = heads
         self.pad_id = pad_id
+        self.use_codebook = use_codebook
 
-        self.text_projection = nn.Parameter(torch.empty(width, output_dim))
+        if projection_in_dim is None:
+            projection_in_dim = width
+        self.projection_in_dim = projection_in_dim
 
         if embed_cls:
             self.cls_emb = nn.Parameter(torch.empty(width))
@@ -548,11 +679,26 @@ class TextTransformer(nn.Module):
             act_layer=act_layer,
             norm_layer=norm_layer,
         )
-        self.ln_final = norm_layer(width)
+
+        self.global_average_pool = global_average_pool
 
         self.register_buffer('attn_mask', self.build_attention_mask(), persistent=False)
 
+        if not use_codebook:
+            if attentional_pool:
+                self.attn_pool = AttentionalPooler(output_dim, width, n_head=attn_pooler_heads, n_queries=n_queries)
+                self.ln_final = norm_layer(output_dim)
+                projection_in_dim = output_dim
+            else:
+                self.attn_pool = None
+                self.ln_final = norm_layer(width)
+            self.text_projection = nn.Parameter(torch.empty(projection_in_dim, output_dim))
+
+        self.create_extra_modules()
         self.init_parameters()
+
+    def create_extra_modules(self):
+        pass
 
     def init_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
@@ -569,8 +715,8 @@ class TextTransformer(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+        if getattr(self, "text_projection", None) is not None:
+            nn.init.normal_(self.text_projection, std=self.projection_in_dim ** -0.5)
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
@@ -613,6 +759,12 @@ class TextTransformer(nn.Module):
         x = self.transformer(x, attn_mask=attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        return self.forward_output(x, text)
+
+    def forward_output(self, x: torch.Tensor, text: torch.Tensor):  # not used directly
+        if self.use_codebook:
+            return x
+
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         if self.cls_emb is not None:
@@ -629,6 +781,51 @@ class TextTransformer(nn.Module):
             return pooled, tokens
 
         return pooled
+
+
+class SPAROTextTransformer(TextTransformer):
+    def __init__(
+        self,
+        L,
+        V,
+        width,
+        heads,
+        attn_dim=None,
+        value_dim=None,
+        sparo_heads=None,
+        share_kv=True,
+        **kwargs,
+    ):
+        self.L = L
+        self.V = V
+        self.attn_dim = attn_dim
+        self.value_dim = value_dim
+        self.sparo_heads = sparo_heads
+        self.width = width
+        self.heads = heads
+        self.share_kv = share_kv
+        super().__init__(width=width, heads=heads, **kwargs)
+
+    def create_extra_modules(self):
+        if self.attn_dim is None:
+            self.attn_dim = self.width // self.heads
+        self.sparo = SPARO(
+            dim=self.width,
+            L=self.L,
+            V=self.V,
+            attn_dim=self.attn_dim,
+            value_dim=self.value_dim,
+            num_heads=self.sparo_heads,
+            share_kv=self.share_kv,
+        )
+        del self.text_projection
+
+    def forward_output(self, x: torch.Tensor, text: torch.Tensor):  # not used directly
+        x = self.ln_final(x)  # B, L, H
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        out, attn = self.sparo(x, text.argmax(dim=-1))  # B, L, V
+        out = out.view(-1, self.L * self.V)
+        return out, attn
 
 
 class MultimodalTransformer(Transformer):
@@ -724,3 +921,180 @@ class MultimodalTransformer(Transformer):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
+
+
+class Sparsemax(nn.Module):
+    """Sparsemax function, based on https://github.com/yuxiaochen1103/FDT."""
+
+    def __init__(self, dim=None):
+        """Initialize sparsemax activation
+        
+        Args:
+            dim (int, optional): The dimension over which to apply the sparsemax function.
+        """
+        super(Sparsemax, self).__init__()
+
+        self.dim = -1 if dim is None else dim
+
+    def forward(self, input):
+        """Forward function.
+        Args:
+            input (torch.Tensor): Input tensor. First dimension should be the batch size
+        Returns:
+            torch.Tensor: [batch_size x number_of_logits] Output tensor
+        """
+        # Sparsemax currently only handles 2-dim tensors,
+        # so we reshape to a convenient shape and reshape back after sparsemax
+        input = input.transpose(0, self.dim)
+        original_size = input.size()
+        input = input.reshape(input.size(0), -1)
+        input = input.transpose(0, 1)
+        dim = 1
+
+        number_of_logits = input.size(dim)
+
+        # Translate input by max for numerical stability
+        input = input - torch.max(input, dim=dim, keepdim=True)[0].expand_as(input)
+
+        # Sort input in descending order.
+        # (NOTE: Can be replaced with linear time selection method described here:
+        # http://stanford.edu/~jduchi/projects/DuchiShSiCh08.html)
+        zs = torch.sort(input=input, dim=dim, descending=True)[0]
+        range = torch.arange(start=1, end=number_of_logits + 1, step=1, device=input.device, dtype=input.dtype).view(1, -1)
+        range = range.expand_as(zs)
+
+        # Determine sparsity of projection
+        bound = 1 + range * zs
+        cumulative_sum_zs = torch.cumsum(zs, dim)
+        is_gt = torch.gt(bound, cumulative_sum_zs).type(input.type())
+        k = torch.max(is_gt * range, dim, keepdim=True)[0]
+
+        # Compute threshold function
+        zs_sparse = is_gt * zs
+
+        # Compute taus
+        taus = (torch.sum(zs_sparse, dim, keepdim=True) - 1) / k
+        taus = taus.expand_as(input)
+
+        # Sparsemax
+        self.output = torch.max(torch.zeros_like(input), input - taus)
+
+        # Reshape back to original shape
+        output = self.output
+        output = output.transpose(0, 1)
+        output = output.reshape(original_size)
+        output = output.transpose(0, self.dim)
+
+        return output
+
+    def backward(self, grad_output):
+        """Backward function."""
+        dim = 1
+
+        nonzeros = torch.ne(self.output, 0)
+        sum = torch.sum(grad_output * nonzeros, dim=dim) / torch.sum(nonzeros, dim=dim)
+        self.grad_input = nonzeros * (grad_output - sum.expand_as(grad_output))
+
+        return self.grad_input
+
+
+class FDTQueryModel(nn.Module):
+    """Based on https://github.com/yuxiaochen1103/FDT."""
+
+    def __init__(self, ft_dim, sd_dim, temperature=1000, att_func_type='sparsemax', pool_type='max'):
+        '''
+        ft_dim: feature dim of image patch or text token
+        sd_dim: dim of FDT
+        temperature: temperature for softmax or sparsemax
+        att_func_type: attention normlization function type
+        pool_type: pooling type for attention weights
+        '''
+        super().__init__()
+
+        #activation 
+        assert att_func_type in ['softmax', 'sigmoid', 'sparsemax']
+        self.att_func_type = att_func_type
+
+        assert pool_type in ['mean', 'max', 'sum']
+        self.pool_type = pool_type
+
+        if self.att_func_type == 'softmax':
+            self.att_activation = nn.Softmax(dim=-1)
+        elif self.att_func_type == 'sparsemax':
+            self.att_activation = Sparsemax(dim=-1)
+        else:
+            self.att_activation = nn.Sigmoid()
+
+        self.att_dim = sd_dim
+        self.temperature = temperature
+        
+        #map patch/text tokens to codebook (query) spaces
+        #---note that we donot use mapping for FDT
+
+        self.q_map = nn.Sequential(
+            nn.LayerNorm(ft_dim),
+            nn.Linear(ft_dim, sd_dim),
+            nn.GELU(),
+            nn.LayerNorm(sd_dim),
+            nn.Linear(sd_dim, sd_dim)
+        )
+
+    def forward(self, ft, sd, eos_pos=None, return_token_att=False):
+        '''
+        Args:
+            ft: [batch, token_num, ft_dim]
+            sd: [FDT_num, sd_dim]
+            mask: [batch, token_num]: mask for padded tokens.
+            return_token_att: flag for returning attention weights before nomalization.
+            used for visualizing FDT.
+        Returns:
+        '''
+        #map image/text token to query space
+        q = self.q_map(ft) #bacth, token_num, dim
+
+        k = sd #code_num, sd_dim
+        k = k.unsqueeze(0) #[1, code_num, sd_dim]
+        k = k.transpose(2, 1) #[1,sd_dim, sd_num]
+        
+        #-----calculate inner dot
+        inner_dot = torch.matmul(q, k) #[bacth, token_num, code_num]
+
+        if return_token_att: #cosine sim
+            token_att = inner_dot
+
+        inner_dot = inner_dot / math.sqrt(self.att_dim) #scale dot norm
+
+        if eos_pos is not None: # mask paded tokens
+            mask = (torch.arange(q.size(1), device=q.device).unsqueeze(0) <= eos_pos.unsqueeze(-1)).to(inner_dot)
+            assert mask.shape == q.shape[:2]
+
+            inner_dot = inner_dot * mask.unsqueeze(-1) #sigmod(-inf) = 0, softmax(-inf) = 0
+
+            if return_token_att: #if has pad, return maksed
+                token_att = inner_dot
+
+        # temptural norm
+        inner_dot = inner_dot / self.temperature #[bacth, token_num, code_num]
+
+        #pooling
+        if self.pool_type == 'sum':
+            inner_dot = inner_dot.sum(1) #mean poolings
+        elif self.pool_type == 'mean':
+            inner_dot = inner_dot.mean(1)
+        else:
+            inner_dot = inner_dot.max(1)[0]
+
+        #----get attention weights
+        att_weight = self.att_activation(inner_dot) #normaliztion
+
+        #----calculate weighted sum of v
+        #v = self.ln_v(ft) #map to v_space
+        
+        att_ft = att_weight @ sd  #[bacth, dictory_size] * [dictory_size, dim]  ---> [bacth, sd_num, dim]
+
+        if self.att_func_type == 'sigmoid':
+            att_ft = att_ft / att_weight.sum(dim=-1, keepdim=True)
+        
+        if return_token_att:
+            return token_att, att_ft, sd
+        return att_ft

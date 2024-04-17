@@ -120,6 +120,7 @@ def create_model(
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
         require_pretrained: bool = False,
+        override_config: Optional[Dict[str, Any]] = None,
 ):
     has_hf_hub_prefix = model_name.startswith(HF_HUB_PREFIX)
     if has_hf_hub_prefix:
@@ -147,9 +148,19 @@ def create_model(
             precision=precision,
             device=device,
             cache_dir=cache_dir,
+            override_config=override_config,
         )
     else:
         model_cfg = model_cfg or get_model_config(model_name)
+        if override_config is not None:
+            for k, v in override_config.items():
+                if k in model_cfg:
+                    if isinstance(model_cfg[k], dict):
+                        model_cfg[k].update(v)
+                    else:
+                        model_cfg[k] = v
+                else:
+                    raise RuntimeError(f'Override key {k} not found in model config.')
         if model_cfg is not None:
             logging.info(f'Loaded {model_name} model config.')
         else:
@@ -304,6 +315,7 @@ def create_model_and_transforms(
         aug_cfg: Optional[Union[Dict[str, Any], AugmentationCfg]] = None,
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
+        override_config: Optional[Dict[str, Any]] = None,
 ):
     model = create_model(
         model_name,
@@ -319,6 +331,7 @@ def create_model_and_transforms(
         pretrained_hf=pretrained_hf,
         cache_dir=cache_dir,
         output_dict=output_dict,
+        override_config=override_config,
     )
 
     image_mean = image_mean or getattr(model.visual, 'image_mean', None)

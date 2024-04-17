@@ -219,21 +219,26 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             }            
             log_data.update({name:val.val for name,val in losses_m.items()})
 
+            wandb_dict = {}
             for name, val in log_data.items():
                 name = "train/" + name
                 if tb_writer is not None:
                     tb_writer.add_scalar(name, val, step)
                 if args.wandb:
-                    assert wandb is not None, 'Please install wandb.'
-                    wandb.log({name: val, 'step': step})
+                    wandb_dict[name] = val
+            if args.wandb:
+                assert wandb is not None, 'Please install wandb.'
+                wandb.log(wandb_dict, step=step)
 
             # resetting batch / data time meters per log window
             batch_time_m.reset()
             data_time_m.reset()
     # end for
 
+    return step
 
-def evaluate(model, data, epoch, args, tb_writer=None):
+
+def evaluate(model, data, epoch, step, args, tb_writer=None):
     metrics = {}
     if not is_master(args):
         return metrics
@@ -328,8 +333,11 @@ def evaluate(model, data, epoch, args, tb_writer=None):
 
     if args.wandb:
         assert wandb is not None, 'Please install wandb.'
+        wandb_dict = {}
         for name, val in metrics.items():
-            wandb.log({f"val/{name}": val, 'epoch': epoch})
+            wandb_dict[f"val/{name}"] = val
+        wandb_dict['epoch'] = epoch
+        wandb.log(wandb_dict, step=step)
 
     return metrics
 

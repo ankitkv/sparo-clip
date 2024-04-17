@@ -1,5 +1,6 @@
 import argparse
 import ast
+import json
 
 
 def get_default_params(model_name):
@@ -325,6 +326,12 @@ def parse_args(args):
         help="Name of the project if logging with wandb.",
     )
     parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Entity of the project if logging with wandb.",
+    )
+    parser.add_argument(
         "--debug",
         default=False,
         action="store_true",
@@ -435,6 +442,17 @@ def parse_args(args):
         default=None,
         help='Replace the network linear layers from the bitsandbytes library. '
         'Allows int8 training/inference, etc.'
+    )
+    parser.add_argument(
+        "--max-params",
+        type=int,
+        default=-1,
+        help="Max params the model can have (-1 to disable)."
+    )
+    parser.add_argument(
+        "--override-model-config",
+        type=json.loads,
+        help='Override model config with key-value pairs.'
     )
     args = parser.parse_args(args)
 
