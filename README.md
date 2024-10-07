@@ -1,5 +1,6 @@
 <h1 align="center">SPARO: Selective Attention for Robust and Compositional Transformer Encodings for Vision</h1>
 <h3 align="center">Ankit Vani, Bac Nguyen, Samuel Lavoie, Ranjay Krishna, Aaron Courville</h3>
+<h3 align="center">Published at ECCV 2024</h3>
 
 ### [[Paper, arXiv]](https://arxiv.org/abs/2404.15721)
 
@@ -17,10 +18,10 @@ This code is based on [OpenCLIP v2.20.0](https://github.com/mlfoundations/open_c
 
 ### Citation
 ```
-@article{vani2024sparo,
+@inproceedings{vani2024sparo,
   title={{SPARO}: Selective Attention for Robust and Compositional Transformer Encodings for Vision},
   author={Ankit Vani and Bac Nguyen and Samuel Lavoie and Ranjay Krishna and Aaron Courville},
-  journal={arXiv preprint arXiv:2404.15721},
-  year={2024}
+  booktitle = {European Conference on Computer Vision},
+  year={2024},
 }
 ```
